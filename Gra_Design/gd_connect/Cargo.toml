@@ -1,0 +1,15 @@
+[package]
+name = "gd_connect"
+version = "0.1.0"
+edition = "2024"
+
+
+
+[dependencies]
+tokio = {workspace = true}
+anyhow = {workspace = true}
+tracing = {workspace = true}
+gd_common = {workspace = true}
+
+rumqttc = {workspace = true}
+dotenv ={workspace = true}

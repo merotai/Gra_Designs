@@ -1,0 +1,11 @@
+[package]
+name = "gd_algorithm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {workspace = true}
+anyhow = {workspace = true}
+gd_common = {workspace = true}
+lettre = {workspace = true}
+dotenv = {workspace = true}

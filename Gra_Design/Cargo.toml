@@ -1,0 +1,46 @@
+[package]
+name = "Gra_Design"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    "gd_connect",
+    "gd_server",
+    "gd_common",
+    "gd_algorithm",
+]
+
+[dependencies]
+gd_common = {workspace = true}
+gd_connect = {workspace = true}
+gd_algorithm = {workspace = true}
+tokio = { workspace = true }
+anyhow = {workspace = true}
+tracing = {workspace = true}
+
+rumqttc = {workspace = true}
+
+[workspace.dependencies]
+
+gd_connect = {path = "./gd_connect" }
+gd_server = {path = "./gd_server"}
+gd_common = {path = "./gd_common"}
+gd_algorithm = {path = "./gd_algorithm"}
+
+tokio = { version = "1.52.0",features = ["full"] }
+rumqttc = {version = "0.25.0",features = ["default"]}
+
+anyhow = { version = "1.0.100" }
+tracing = { version = "0.1.44" }
+
+actix-web = { version = "4.13.0" }
+serde = { version = "1.0.228" }
+
+lettre = {version = "0.11.21"}
+dotenv = {version = "0.15.0"}
+
+crc = {version = "3.4.0"}
+bytemuck = {version = "1.25.0",features = ["derive"]}
+
+

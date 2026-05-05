@@ -1,0 +1,11 @@
+[package]
+name = "gd_common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = {workspace = true}
+crc = {workspace = true}
+bytemuck = {workspace = true}
+rumqttc = {workspace = true}
+
