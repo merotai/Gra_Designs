@@ -30,6 +30,7 @@ use std::time::{
 };
 use dotenv::dotenv;
 use std::env;
+
 use gd_common::{
     // UDP
     UdpPacket,
@@ -39,6 +40,12 @@ use gd_common::{
 
     // MQTT
     IMUData,
+    func::print_color::{
+        RED,
+        YELLOW,
+        GREEN,
+        BLUE,
+    }
 };
 
 
@@ -46,12 +53,17 @@ use gd_common::{
 /// ----------------------------------------------------------------------------
 /// MQTT
 
+// let topics_h = [
+//     SubscribeFilter::new("IMU".to_string(),QoS::AtLeastOnce),
+//     SubscribeFilter::new("IMU/1".to_string(),QoS::AtLeastOnce),
+//     SubscribeFilter::new("IMU/2".to_string(),QoS::AtLeastOnce),
+//     SubscribeFilter::new("IMU/3".to_string(),QoS::AtLeastOnce),
+// ];
+//
+// client.subscribe_many(topics_h).await?;
 pub async fn run_mqtt_listen_task(
     tx: mpsc::Sender<Publish>
 ) -> Result<()>{
-
-    // let mqtt_username = env::var("MQTT_USERNAME")?;
-    // let mqtt_password = env::var("MQTT_PASSWORD")?;
 
     let mut gd_mqtt_options = MqttOptions::new(
         "mqtt_receiver",
@@ -61,76 +73,86 @@ pub async fn run_mqtt_listen_task(
 
     gd_mqtt_options.set_keep_alive(Duration::from_secs(5));
     gd_mqtt_options.set_credentials("mqtt_listen_wqy","2026gd_wqy");
+
+    // 客户端初始化，申请10个异步通道来接收数据
     let (client, mut event_loop) = AsyncClient::new(gd_mqtt_options, 10);
-
-    // let topics_h = [
-    //     SubscribeFilter::new("IMU".to_string(),QoS::AtLeastOnce),
-    //     SubscribeFilter::new("IMU/1".to_string(),QoS::AtLeastOnce),
-    //     SubscribeFilter::new("IMU/2".to_string(),QoS::AtLeastOnce),
-    //     SubscribeFilter::new("IMU/3".to_string(),QoS::AtLeastOnce),
-    // ];
-    //
-    // client.subscribe_many(topics_h).await?;
-
-    //订阅的单个topic
+    // 订阅的单个topic
     client.subscribe("IMU", QoS::AtLeastOnce).await?;
 
-    println!("[listen_task] 任务启动，tx的通道地址是{:p}",&tx);
+    println!("{} [listen_task] 任务启动",BLUE);
     loop {
         match event_loop.poll().await {
             Ok(Event::Incoming(Packet::Publish(publish))) => {
-                println!("接收到publish, 主题是{:?}", publish.topic);
+                // println!("接收到publish, 主题是{:?}", publish.topic);
+                let topic_l = publish.topic.clone();
                 match tx.send(publish).await {
                     Ok(()) => {
-                        println!("publish内容推送成功");
+                        println!("{} [listen_task] publish内容推送成功,主题是: {}",GREEN,topic_l);
                     },
                     Err(e) => {
-                        eprintln!("publish内容推送失败: {:?}",e);
+                        eprintln!("{} [listen_task] publish内容推送失败: {:?}",RED,e);
                         break;
                     }
                 }
             },
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                println!("MQTT 接收端初始化成功");
+                println!("{} [listen_task] MQTT 接收端初始化成功",GREEN);
             },
             Ok(_) => {
+                // 只接收MQTT相关的内容，不是则跳过
                 // println!("未处理的定义事件: {:?}", content);
             },
             Err(e) => {
-                eprintln!("MQTT 连接错误: {:?}",e);
+                eprintln!("{} [listen_task] MQTT 连接错误: {:?}",RED,e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-
         }
     }
-    println!("MQTT 监听服务结束");
+    println!("MQTT 监听任务结束");
     Ok(())
 
 }
 
 
 pub async fn run_mqtt_handle_task(mut rx:mpsc::Receiver<Publish>,tx: mpsc::Sender<IMUData>) -> Result<()> {
-    println!("[handle_task] 任务启动，rx的通道地址是{:p}",&rx);
+    println!("{} [handle_task] 任务启动",BLUE);
+    let mut buffer = Vec::<u8>::new();
+    const FRAME_SIZE: usize = 241;
+    
     loop {
+        // 20s内通道没有数据取出就退出任务
         match timeout(Duration::from_secs(20),rx.recv()).await {
             Ok(Some(publish)) => {
-                // 成功在20s内收到数据,开始解析数据
-                let parse_data = match IMUData::get_dataset_from_publish(publish) {
-                    Ok(data) => data,
-                    Err(_) => {
-                        println!("解析数据失败");
-                        continue
-                    }
-                };
-                tx.send(parse_data).await?;
+                buffer.extend_from_slice(&publish.payload);
+                // while语句处理网络差的时候数据粘包情况
+                while buffer.len() >= FRAME_SIZE {
+                    let payload_data: Vec<u8> = buffer.drain(..FRAME_SIZE).collect();
+                    // 重新校正的publish
+                    let publish_refract = Publish::new(
+                        publish.topic.clone(),
+                        publish.qos,
+                        payload_data,
+                    );
 
+                    match IMUData::get_dataset_from_publish(publish_refract) {
+                        Ok(data) => {
+                            println!("{} [handle_task]数据解析成功，来自{}号的传感器数据",GREEN,data.imu_num);
+                            if let Err(e) = tx.send(data).await {
+                                eprintln!("{} [handle_task]发送IMUData到数据通道失败同时丢弃该帧: {:?}",RED,e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("{} [handle_task]解析数据失败，同时丢弃该帧: {:?}",RED,e);
+                        }
+                    }
+                }// while
             },
             Ok(None) => {
-                println!("监听传输通道关闭");
+                println!("{} [handle_task]监听传输通道关闭",YELLOW);
                 break
             },
             Err(e) => {
-                eprintln!("[handle_task]出现超时情况，20s内无数据发送过来，请检查数据通道以及采集端");
+                eprintln!("{} [handle_task]出现超时情况，20s内无数据发送过来，请检查数据通道以及采集端",RED);
                 return Err(anyhow!(e))
             }
 

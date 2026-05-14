@@ -1,6 +1,5 @@
-mod func;
-
-mod data_base;
+pub mod func;
+pub mod data_base;
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -122,34 +121,76 @@ impl BMI270Samples {
 }
 
 
+pub struct SMSCooldownPeriod {
+
+    pub next_tilt_warning_sample: u64,
+    ///
+    pub tilt_warning_cooldown_period: u64,
+
+    pub next_tilt_alarm_sample: u64,
+    /// 倾斜冷却样本数
+    pub tilt_alarm_cooldown_period: u64,
+
+    ///
+    pub next_microseism_alarm_sample: u64,
+    /// 微震冷却样本数
+    pub microseism_cooldown_period: u64,
+
+    /// 方差增长
+    pub next_variance_alarm_sample: u64,
+    pub variance_cooldown_period: u64,
+
+    /// 沉降异常
+    pub next_settlement_alarm_sample: u64,
+    pub settlement_cooldown_period: u64,
+
+    /// 传感器异常
+    pub next_sensor_anomaly_sample: u64,
+    pub sensor_anomaly_cooldown_period: u64,
+}
+
+impl SMSCooldownPeriod {
+    pub fn new(sample_hz : u64) -> SMSCooldownPeriod {
+        Self {
+            next_tilt_warning_sample : 0,
+            tilt_warning_cooldown_period : 30 * sample_hz, // 触发报警后的300个样本内不会再次触发报警，也就是30s内
+            next_tilt_alarm_sample : 0,
+            tilt_alarm_cooldown_period : 30 * sample_hz, // 触发后300个样本以内
+
+            next_microseism_alarm_sample : 0,
+            microseism_cooldown_period : 60 * sample_hz, // 触发后600个样本以内, 1min
+
+            next_variance_alarm_sample : 0,
+            variance_cooldown_period : 300 * sample_hz, // 触发后3000个样本以内, 5min
+
+            next_settlement_alarm_sample : 0,
+            settlement_cooldown_period : 10 * sample_hz, // 触发后100个样本以内, 10s
+
+            next_sensor_anomaly_sample : 0,
+            sensor_anomaly_cooldown_period : 30 * sample_hz, // 触发后300个样本以内, 30s
+        }
+    }
+}
+
 pub enum SMSType {
     // 报警类型1 倾斜预警
-    TiltWarnSensor(u8),
+    TiltWarnSensor(usize,f32,f32,f32),
 
     // 报警类型2 倾斜报警
-    TiltAlarmSensor(u8),
+    TiltAlarmSensor(usize,f32,f32,f32),
     // 报警类型3 微震报警
-    MicroseismSensor(u8),
+    MicroseismSensor(usize,f32,f32),
 
     
     // 报警类型4 裂隙扩展报警
-    VarianceGrowSensor(u8),
+    VarianceGrowSensor(usize,f32,f32,f32),
     
     // 报警类型5 沉降报警
-    RapidSettleSensor(u8),
+    RapidSettleSensor(usize,f32),
     
     // 报警类型6 传感器异常
-    WrongSensor(u8),
+    WrongSensor(usize,String),
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -220,9 +261,6 @@ impl IMUData {
     }
     
 }
-
-
-
 
 
 

@@ -3,25 +3,58 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
     env,
+    sync::Arc,
+
 };
 use std::fmt::format;
 use gd_common::{
     BMI270Samples,
     IMUData,
     SMSType,
+    SMSCooldownPeriod,
+
+
+
+    data_base::{
+        db_mongo::{
+            MongoDBClient,
+        },
+        db_mongo_models::{
+            AlarmInfo,
+            InFo,
+        }
+    },
+
+    func::{
+        algor_web_share_state::{
+            SharedState,
+            AlarmState
+        },
+
+        print_color::{
+            GREEN,
+            BLUE,
+            YELLOW,
+            RED,
+        },
+    }
 };
 use tokio::{
     sync::{
         mpsc,
+        RwLock,
     },
     time::timeout
 };
+
+use chrono::{ Utc};
+
 use anyhow::{
     Result,
     anyhow
 };
 
-
+#[derive(Debug)]
 pub enum RockAlert {
     None,
 
@@ -117,23 +150,26 @@ pub struct AlgorParams{
     /// 上次上报的样本号
     last_log_sample: u64,
 
+    ///
+    sms_state: SMSCooldownPeriod,
+
 }
 
 
 impl AlgorParams {
     /// 本次采用的10Hz采样频率
-    pub fn new(sample_rate_hz: f32) -> AlgorParams {
+    pub fn new(sample_rate_hz: f32,imu_num: usize) -> AlgorParams {
         assert!(sample_rate_hz > 0.0, "采样必须大于0");
         let short_term_seconds = 10.0;  // 10s
-        let long_term_seconds = 3600.0; //1h
+        let long_term_seconds = 300.0; //5min
 
         let short_term_size_h = (sample_rate_hz * short_term_seconds) as usize;   // 100样本长度
-        let long_term_size_h = (sample_rate_hz * long_term_seconds) as usize;     // 36000样本长度
+        let long_term_size_h = (sample_rate_hz * long_term_seconds) as usize;     // 3000样本长度
 
         let microseism_check_interval_h = (sample_rate_hz * 60.0) as u64;         // 600样本/min
 
         Self {
-            imu_number: 0,
+            imu_number: imu_num,
             long_term_window: VecDeque::with_capacity(long_term_size_h),
             short_term_window: VecDeque::with_capacity(short_term_size_h),
             long_term_size: long_term_size_h,
@@ -159,10 +195,12 @@ impl AlgorParams {
             sample_count: 0,
             last_microseism_reset: 0,
             last_log_sample: 0,
+
+            sms_state: SMSCooldownPeriod::new(10),
         }
     }
     // 处理一个样本
-    pub fn process_single_imu_data(&mut self, sample: BMI270Samples) -> RockAlert {
+    pub fn process_single_imu_data(&mut self, sample: BMI270Samples,imu_number: u8) -> RockAlert {
 
         self.sample_count += 1;
 
@@ -173,17 +211,20 @@ impl AlgorParams {
         }
 
         let acc_mag = sample.acc_magnitude();
+
         self.long_term_window.push_back(acc_mag);
         if self.long_term_window.len() > self.long_term_size {
             self.long_term_window.pop_front();
         }
 
-        // 第一阶段初始化基准,一个小时初始化
+        // 第一阶段初始化基准,5min的初始化
         if !self.calibration_complete && self.sample_count >= self.long_term_size as u64 {
             //TODO
             self.calibrate_baseline();
             self.calibration_complete = true;
             let hours = self.sample_count as f32 / 36000.0;
+            println!("{} [algor_task] {}号传感器基准建立完成，({}小时数据) | 初始姿态: pitch = {:.2}°, roll = {:.2}° | 正常微震方差: {:.6})",
+                   BLUE, imu_number, hours, self.baseline_pitch, self.baseline_roll, self.baseline_variance);
 
             return RockAlert::Info {
                 content: format!(
@@ -194,38 +235,54 @@ impl AlgorParams {
         }
         // 校准未完成，只采集数据
         if !self.calibration_complete {
-            if self.sample_count - self.last_log_sample >= 36000 {
+            if self.sample_count - self.last_log_sample >= 3000 {
                 self.last_log_sample = self.sample_count;
-                let hours = self.sample_count as f32 / 3600.0;
-                println!("数据校准中...已采集{:.1}小时的数据", hours);
+                let hours = self.sample_count as f32 / 36000.0;
+                println!(" {} [algor_task] 数据校准中...已采集{:.1}小时的数据",GREEN, hours);
             }
             return RockAlert::None;
         }
-
-        //-- 检测1，缓慢倾斜
+        //------------------------------------------------------------------------------------------
+        //--------------------------------- 检测1，缓慢倾斜 -------------------------------------------
+        //------------------------------------------------------------------------------------------
         let (pitch,roll) = self.compute_tilt_angles(&sample);
         let pitch_change = (pitch - self.baseline_pitch).abs();
         let roll_change = (roll - self.baseline_roll).abs();
         let max_tilt = pitch_change.max(roll_change);
 
         if max_tilt > self.tilt_alarm_deg {
-            return RockAlert::TiltAlarm {
-                current_pitch: pitch,
-                current_roll: roll,
-                since_baseline_hours: self.sample_count as f32 / 36000.0,
+            // 检测倾斜报警冷却期条件
+            if self.sample_count >= self.sms_state.next_tilt_alarm_sample{
+                self.sms_state.next_tilt_alarm_sample = self.sample_count + self.sms_state.tilt_alarm_cooldown_period;
+                return RockAlert::TiltAlarm {
+                    current_pitch: pitch,
+                    current_roll: roll,
+                    since_baseline_hours: self.sample_count as f32 / 36000.0,
 
-            };
+                };
+            } else {
+                println!("{} [algor_task]倾斜报警冷却中",YELLOW);
+            }
+
         }
         if max_tilt > self.tilt_warning_deg {
-            return RockAlert::TiltWarning {
-                current_pitch: pitch,
-                current_roll: roll,
-                since_baseline_hours: self.sample_count as f32 / 36000.0,
+            // 检测倾斜预警冷却期条件
+            if self.sample_count >= self.sms_state.next_tilt_warning_sample {
+                self.sms_state.next_tilt_warning_sample = self.sample_count + self.sms_state.tilt_warning_cooldown_period;
+                return RockAlert::TiltWarning {
+                    current_pitch: pitch,
+                    current_roll: roll,
+                    since_baseline_hours: self.sample_count as f32 / 36000.0,
+                }
+            } else {
+                println!("{} [algor_task]倾斜预警冷却中",YELLOW);
             }
-        }
 
-        //-- 检测2 微震计数，岩爆预警
-        if (acc_mag -1.0).abs() > self.microseism_threshold_g {
+        }
+        //------------------------------------------------------------------------------------------
+        //--------------------------------- 检测2 微震计数，岩爆预警 -----------------------------------
+        //------------------------------------------------------------------------------------------
+        if (acc_mag - 1.0).abs() > self.microseism_threshold_g {
             self.microseism_count += 1;
         }
         // 每60s检测一次微震频率
@@ -243,48 +300,66 @@ impl AlgorParams {
             self.microseism_count = 0;
             self.last_microseism_reset = self.sample_count;
         }
-        //-- 检测3 方差增长 裂缝扩展
-        // 每10分钟检查一次长期方差
-        if self.sample_count % 6000 == 0 && self.long_term_window.len() >= self.long_term_size / 2{
+        //------------------------------------------------------------------------------------------
+        //-------------------------------- 检测3 方差增长 裂缝扩展 ------------------------------------
+        //------------------------------------------------------------------------------------------
+        // 每8分钟检查一次长期方差
+        if self.sample_count % 4800 == 0 && self.long_term_window.len() >= self.long_term_size / 2{
             let current_variance = self.compute_long_term_variance();
             if self.baseline_variance > 0.0 {
-                let ratio = current_variance / self.baseline_variance;
+                let ratio_l = current_variance / self.baseline_variance;
 
-                if ratio > self.variance_growth_ratio {
+                if ratio_l > self.variance_growth_ratio {
                     return RockAlert::VarianceGrowth {
                         current: current_variance,
                         baseline: self.baseline_variance,
-                        ratio: ratio,
+                        ratio: ratio_l,
                     };
                 }
             }
         }
-
-        //-- 检测4 突然沉降塌陷
+        //------------------------------------------------------------------------------------------
+        //--------------------------------- 检测4 突然沉降塌陷 ----------------------------------------
+        //------------------------------------------------------------------------------------------
         let deviation = (acc_mag - 1.0).abs();
         if deviation > self.settlement_threshold_g {
             self.consecutive_anomalies += 1;
             if self.consecutive_anomalies >= self.consecutive_anomaly_threshold {
-                self.consecutive_anomalies = 0;
-                return RockAlert::RapidSettlement {
-                    magnitude_g: deviation,
-                };
+
+                if self.sms_state.next_settlement_alarm_sample <= self.sample_count {
+                    self.sms_state.next_settlement_alarm_sample = self.sample_count + self.sms_state.settlement_cooldown_period;
+                    self.consecutive_anomalies = 0;
+                    return RockAlert::RapidSettlement {
+                        magnitude_g: deviation,
+                    };
+                } else {
+                    println!("{} [algor_task]突然沉降报警冷却中",YELLOW);
+                }
+
             }
         } else {
             self.consecutive_anomalies = 0;
         }
-
-        //-- 检测5 传感器异常
+        //------------------------------------------------------------------------------------------
+        //---------------------------------- 检测5 传感器异常 -----------------------------------------
+        //------------------------------------------------------------------------------------------
         // 加速度全0或长时间不变
         if acc_mag < 0.01 {
-            return RockAlert::SensorAnomaly {
-                reason: "加速度变化值接近0，传感器可能故障".to_string(),
-            };
+            if self.sample_count >= self.sms_state.next_tilt_warning_sample {
+                self.sms_state.next_sensor_anomaly_sample = self.sample_count + self.sms_state.settlement_cooldown_period;
+                return RockAlert::SensorAnomaly {
+                    reason: "加速度变化值接近0，传感器可能故障".to_string(),
+                };
+            }
+
         }
         if acc_mag > 10.0 {
-            return RockAlert::SensorAnomaly {
-                reason: format!("加速度变化值异常过大: {:2}g", acc_mag),
-            };
+            if self.sample_count >= self.sms_state.next_tilt_warning_sample {
+                self.sms_state.next_sensor_anomaly_sample = self.sample_count + self.sms_state.settlement_cooldown_period;
+                return RockAlert::SensorAnomaly {
+                    reason: format!("加速度变化值异常过大: {:2}g", acc_mag),
+                };
+            }
         }
         RockAlert::None
 
@@ -345,261 +420,193 @@ impl AlgorParams {
             .sum::<f32>() / n
 
     }
-    /// 获取当前状态摘要
-    pub fn status(&self) -> String {
-        let hours = self.sample_count as f32 / 36000.0;
 
-        format!(
-            "运行{:.1}h | 样本{} | 校准{} | 姿态(pitch = {:.2}°,roll = {:.2}° ) | 当前微震计数: {}",
-            hours, self.sample_count, self.calibration_complete,
-            self.baseline_pitch, self.baseline_roll, self.microseism_count
-        )
+    /// 获取当前窗口的角度值
+    pub fn get_current_tilt_angles(&self) -> (f32,f32) {
+        if let Some(latest) = self.short_term_window.back() {
+            let pitch = latest.ax_g.atan2(
+                (latest.ay_g.powi(2) + latest.az_g.powi(2)).sqrt()
+            ).to_degrees();
+            let roll = latest.ay_g.atan2(
+                (latest.ax_g.powi(2) + latest.az_g.powi(2)).sqrt()
+            ).to_degrees();
+            (pitch, roll)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
+} // impl
+
+/// 处理 RockAlert类型，并发送到SMSType数据通道里面
+fn handle_sensor_alert(
+    sensor_id: usize,
+    alert_type: RockAlert,
+    tx: &mpsc::Sender<SMSType>
+) {
+    match alert_type {
+        RockAlert::None => {},
+        RockAlert::Info {content} => {
+            println!("消息如下: {}", content);
+        },
+        RockAlert::TiltWarning {current_pitch,current_roll,since_baseline_hours} => {
+            match tx.try_send(SMSType::TiltWarnSensor(
+               sensor_id, current_pitch, current_roll, since_baseline_hours
+            )) {
+                Ok(_) => {
+                    println!("{}号，发送倾斜预警",sensor_id);
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送倾斜预警失败",sensor_id);
+                }
+            }
+        },
+        RockAlert::TiltAlarm {current_pitch, current_roll, since_baseline_hours} => {
+            match tx.try_send(SMSType::TiltAlarmSensor(
+                sensor_id, current_pitch, current_roll, since_baseline_hours
+            )) {
+                Ok(_) => {
+                    println!("{}号，发送倾斜报警",sensor_id)
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送倾斜报警失败",sensor_id);
+                }
+            }
+        },
+        RockAlert::MicroseismIncrease { rate_per_min, threshold } => {
+            match tx.try_send(SMSType::MicroseismSensor(sensor_id, rate_per_min, threshold)) {
+                Ok(_) => {
+                    println!("{}号，发送微震报警", sensor_id)
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送微震报警失败", sensor_id)
+                },
+            }
+        },
+        RockAlert::VarianceGrowth { current, baseline, ratio } => {
+            match tx.try_send(SMSType::VarianceGrowSensor(sensor_id, current, baseline, ratio)) {
+                Ok(_) => {
+                    println!("{}号，发送裂隙扩展报警", sensor_id)
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送裂隙扩展报警失败", sensor_id)
+                },
+            }
+        },
+        RockAlert::RapidSettlement { magnitude_g } => {
+            match tx.try_send(SMSType::RapidSettleSensor(sensor_id, magnitude_g)) {
+                Ok(_) => {
+                    println!("{}号，发送沉降报警", sensor_id)
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送沉降报警失败", sensor_id)
+                },
+            }
+        },
+
+        RockAlert::SensorAnomaly { reason } => {
+            println!("传感器异常: {}", reason);
+            match tx.try_send(SMSType::WrongSensor(sensor_id, reason)) {
+                Ok(_) => {
+                    println!("{}号，发送传感器异常报警", sensor_id)
+                },
+                Err(_) => {
+                    eprintln!("{}号，发送传感器异常报警失败", sensor_id)
+                },
+            }
+        }
     }
 }
 
 
-/// 算法分析任务
-pub async fn run_algor_analyse_task(mut rx: mpsc::Receiver<IMUData>, tx: mpsc::Sender<SMSType>) -> Result<()> {
-    let mut sensor_imu_1 = AlgorParams::new(10.0);
-    let mut sensor_imu_2 = AlgorParams::new(10.0);
-    let mut sensor_imu_3 = AlgorParams::new(10.0);
-    println!("[algor_task]算法分析任务启动");
-    loop {
-        match timeout(Duration::from_secs(20),rx.recv()).await {
-            Ok(Some(data_h)) => {
-                match data_h.imu_num {
-                    1 => {
-                        // 1号传感器
-                        for sample in data_h.imu_dataset.into_iter() {
-                            match sensor_imu_1.process_single_imu_data(sample) {
-                                RockAlert::None => continue,
-                                RockAlert::Info {content} => {
-                                    println!("消息如下: {}", content);
-                                },
-                                RockAlert::TiltWarning {..} => {
-                                    match tx.try_send(SMSType::TiltWarnSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送倾斜预警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("1号，发送倾斜预警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::TiltAlarm {..} => {
-                                    match tx.try_send(SMSType::TiltAlarmSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送倾斜报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("1号，发送倾斜报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::MicroseismIncrease {rate_per_min,..} => {
-                                    match tx.try_send(SMSType::MicroseismSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送微震报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("1号，发送微震报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::VarianceGrowth {..} => {
-                                    match tx.try_send(SMSType::VarianceGrowSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送裂隙扩展报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("1号，发送裂隙扩展报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::RapidSettlement {..} => {
-                                    match tx.try_send(SMSType::RapidSettleSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送沉降报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("1号，发送沉降报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::SensorAnomaly {reason} => {
-                                    println!("传感器异常: {}", reason);
-                                    match tx.try_send(SMSType::WrongSensor(1)) {
-                                        Ok(_) => {
-                                            println!("1号，发送传感器异常报警");
-                                        },
-                                        Err(_) => {
-                                            println!("1号，发送传感器异常报警失败");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    2 => {
-                        // 2号传感器
-                        for sample in data_h.imu_dataset.into_iter() {
-                            match sensor_imu_2.process_single_imu_data(sample) {
-                                RockAlert::None => continue,
-                                RockAlert::Info {content} => {
-                                    println!("消息如下: {}", content);
-                                },
-                                RockAlert::TiltWarning {..} => {
-                                    match tx.try_send(SMSType::TiltWarnSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送倾斜预警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("2号，发送倾斜预警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::TiltAlarm {..} => {
-                                    match tx.try_send(SMSType::TiltAlarmSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送倾斜报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("2号，发送倾斜报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::MicroseismIncrease {rate_per_min,..} => {
-                                    match tx.try_send(SMSType::MicroseismSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送微震报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("2号，发送微震报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::VarianceGrowth {..} => {
-                                    match tx.try_send(SMSType::VarianceGrowSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送裂隙扩展报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("2号，发送裂隙扩展报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::RapidSettlement {..} => {
-                                    match tx.try_send(SMSType::RapidSettleSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送沉降报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("2号，发送沉降报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::SensorAnomaly {reason} => {
-                                    println!("传感器异常: {}", reason);
-                                    match tx.try_send(SMSType::WrongSensor(2)) {
-                                        Ok(_) => {
-                                            println!("2号，发送传感器异常报警");
-                                        },
-                                        Err(_) => {
-                                            println!("2号，发送传感器异常报警失败");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    3 => {
-                        // 3号传感器
-                        for sample in data_h.imu_dataset.into_iter() {
-                            match sensor_imu_3.process_single_imu_data(sample) {
-                                RockAlert::None => continue,
-                                RockAlert::Info {content} => {
-                                    println!("消息如下: {}", content);
-                                },
-                                RockAlert::TiltWarning {..} => {
-                                    match tx.try_send(SMSType::TiltWarnSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送倾斜预警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("3号，发送倾斜预警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::TiltAlarm {..} => {
-                                    match tx.try_send(SMSType::TiltAlarmSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送倾斜报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("3号，发送倾斜报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::MicroseismIncrease {rate_per_min,..} => {
-                                    match tx.try_send(SMSType::MicroseismSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送微震报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("3号，发送微震报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::VarianceGrowth {..} => {
-                                    match tx.try_send(SMSType::VarianceGrowSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送裂隙扩展报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("3号，发送裂隙扩展报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::RapidSettlement {..} => {
-                                    match tx.try_send(SMSType::RapidSettleSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送沉降报警");
-                                        },
-                                        Err(_) => {
-                                            eprintln!("3号，发送沉降报警失败");
-                                        }
-                                    }
-                                },
-                                RockAlert::SensorAnomaly {reason} => {
-                                    println!("传感器异常: {}", reason);
-                                    match tx.try_send(SMSType::WrongSensor(3)) {
-                                        Ok(_) => {
-                                            println!("3号，发送传感器异常报警");
-                                        },
-                                        Err(_) => {
-                                            println!("3号，发送传感器异常报警失败");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
 
-                    _ => {
-                        // 未知编号传感器
-                        println!("未知的传感器编号");
-                    },
+
+/// 算法分析任务
+pub async fn run_algor_analyse_task(mut rx: mpsc::Receiver<IMUData>, tx: mpsc::Sender<SMSType>,shared_state: SharedState) -> Result<()> {
+
+    let mut sensors: Vec<AlgorParams> = (1..=3).map(|id| {AlgorParams::new(10.0,id)}).collect();
+    println!("{} [algor_task]算法分析任务启动",BLUE);
+    loop {
+        // 等待20s，没有数据则退出任务，结束整个服务端
+        match timeout(Duration::from_secs(20), rx.recv()).await {
+            Ok(Some(data_h)) => {
+                let imu_num = data_h.imu_num as usize;
+                // 不是目标编号IMU,直接跳过看下一个
+                if imu_num < 1 || imu_num > sensors.len() {
+                    continue;
                 }
+                let sensor = &mut sensors[imu_num - 1];
+
+                for sample in data_h.imu_dataset.into_iter() {
+                    //
+                    let alert = sensor.process_single_imu_data(sample,imu_num as u8);
+                    let (pitch_h,roll_h) = sensor.get_current_tilt_angles();
+
+                    // 采用局部作用域,操作作用域结束后就会释放相应的内存
+                    // 采用共享变量获取实时数据，同步内容到web后端里面
+                    // Arc<RwLock> 类型申请操作锁后进行修改就会同步到主进程当中
+                    {
+                        let mut state = shared_state.write().await;
+                        if let Some(s) = state.sensors.get_mut(&imu_num) {
+                            s.pitch = pitch_h;
+                            s.roll = roll_h;
+                            s.calibration_complete = sensor.calibration_complete;
+                            s.sample_count = sensor.sample_count;
+                            s.last_update = Utc::now()
+                                                .format("%%Y-%m-%d %H:%M:%S")
+                                                .to_string();
+                            match &alert {
+                                RockAlert::TiltAlarm {..} => {
+                                    s.tilt_state = "alarm".to_string();
+                                },
+                                RockAlert::TiltWarning {..} => {
+                                    s.tilt_state = "warning".to_string();
+                                },
+                                RockAlert::None => {
+                                    if s.tilt_state != "alarm" || s.tilt_state != "warning" {
+                                        s.tilt_state = if sensor.calibration_complete {
+                                            "normal".to_string()
+                                        } else {
+                                            "calibrating".to_string()
+                                        }
+                                    }
+                                },
+                                _ => {
+                                    // 这里忽略其他类型的RockAlert
+                                }
+                            }// match
+                        }
+                        // 填充alarm字段的内容
+                        if !matches!(alert, RockAlert::None | RockAlert::Info {..} ) {
+                            state.alarms.push(AlarmState {
+                                timestamp: Utc::now()
+                                                .format("%Y-%m-%d %H:%M:%S")
+                                                .to_string(),
+                                imu_number: imu_num ,
+                                alarm_type: format!("{:?}",alert),
+                                detail: format!("pitch = {:.2}, roll = {:.2}",pitch_h,roll_h),
+
+                            });
+                            if state.alarms.len() > 100 {
+                                state.alarms.remove(0);
+                            }
+                        }
+
+                    }// 局部作用域
+
+                    // 发送RockAlert到数据通道
+                    handle_sensor_alert(imu_num,alert,&tx);
+                 }
             },
             Ok(None) => {
-                // IMU通道关闭
-                break
+                break;
             },
             Err(_) => {
-                eprintln!("从IMUData通道获取数据失败！");
+                eprintln!("{} [algor_task] 从IMUData通道获取数据失败！", RED);
             }
         }
     }
+
     Ok(())
 }
 
@@ -609,20 +616,31 @@ use lettre::{
     SmtpTransport,
     Transport,
 };
-use dotenv::dotenv;
+
+use mongodb::{
+    bson::{
+        doc,
+        oid::ObjectId,
+        DateTime
+    },
+
+};
+use tokio::sync::mpsc::error::TrySendError;
 
 /// 报警信息发送任务
-pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
+pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>,db_client: MongoDBClient) -> Result<()> {
     // dotenv().ok();
     // let mail_author_code = env::var("MAIL_AUTHORIZE_CODE")?;
     // let from_email = env::var("FROM_EMAIL")?;
     // let to_email = env::var("TO_EMAIL")?;
 
-    let mail_author_code = "soyikaigzoewbfbc";
+    let mail_author_code = "gfufdphqdxxsbbje";
     let from_email = "592778939@qq.com";
     let to_email = "3870180466@qq.com";
 
-
+    let db = db_client.get_db();
+    let alarm_info_collection = db.collection::<AlarmInfo>(AlarmInfo::get_collection_name());
+    
     // let email = Message::builder()
     //     .from("592778939@qq.com".parse()?)
     //     .to("3870180466@qq.com".parse()?)
@@ -632,13 +650,15 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
 
     let mailer = SmtpTransport::starttls_relay("smtp.qq.com")?
         .credentials(credits)
+        .port(587)
         .build();
-    println!("[send_task]报警推送任务启动");
+    println!("{} [send_task]报警推送任务启动", BLUE);
     loop {
         match timeout(Duration::from_secs(20),rx.recv()).await {
             Ok(Some(sms_type)) => {
                 match sms_type {
-                    SMSType::TiltWarnSensor(num) => {
+                    SMSType::TiltWarnSensor(num,pitch,roll,hours) => {
+                        
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -647,20 +667,45 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                         {
                             Ok(email) => email,
                             Err(e) => {
-                                eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                eprintln!("{} [send_task] 邮件构建失败",RED);
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                // 发送成功，存到数据库里面
+                                // 由于报警发送具有冷却期，所以在send_task里面可以直接存入
+                                // 反之，则需要单开一个线程来处理数据库存入
+                                println!("{} [send_task] 邮件发送成功",GREEN);
+
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "岩体倾斜预警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 2,
+                                    infos : InFo::new_tilt(pitch,roll,hours),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将该日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
+
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED)
                             }
                         }
                     }
-                    SMSType::TiltAlarmSensor(num) => {
+                    SMSType::TiltAlarmSensor(num,pitch,roll,hours) => {
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -669,20 +714,41 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                         {
                             Ok(email) => email,
                             Err(e) => {
-                                eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                eprintln!("{} [send_task]邮件构建失败",RED);
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                println!("{} [send_task] 邮件发送成功",GREEN);
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "岩体倾斜报警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 1,
+                                    infos : InFo::new_tilt(pitch,roll,hours),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将倾斜报警日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]倾斜报警日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
+
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED);
                             }
                         }
                     },
-                    SMSType::MicroseismSensor(num) => {
+                    SMSType::MicroseismSensor(num,rate_per_min,threshold) => {
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -691,20 +757,40 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                         {
                             Ok(email) => email,
                             Err(e) => {
-                                eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                eprintln!("{} [send_task]邮件构建失败",RED);
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                println!("{} [send_task]邮件发送成功",GREEN);
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "岩体微震报警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 1,
+                                    infos : InFo::new_microseism(rate_per_min,threshold),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将微震报警日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]微震报警日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED)
                             }
                         }
                     },
-                    SMSType::VarianceGrowSensor(num) => {
+                    SMSType::VarianceGrowSensor(num,current,baseline,ratio) => {
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -714,19 +800,39 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                             Ok(email) => email,
                             Err(e) => {
                                 eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                println!("{} [send_task] 邮件发送成功",GREEN);
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "岩体裂缝扩展报警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 1,
+                                    infos : InFo::new_variance(current,baseline,ratio),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将裂隙扩展日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]裂隙扩展日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED);
                             }
                         }
                     },
-                    SMSType::RapidSettleSensor(num) => {
+                    SMSType::RapidSettleSensor(num,magnitude_g) => {
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -735,20 +841,40 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                         {
                             Ok(email) => email,
                             Err(e) => {
-                                eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                eprintln!("{} [send_task]邮件构建失败",RED);
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                println!("{} [send_task] 邮件发送成功",GREEN);
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "岩体沉降报警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 1,
+                                    infos : InFo::new_settlement(magnitude_g),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将沉降报警日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]沉降报警日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED)
                             }
                         }
                     },
-                    SMSType::WrongSensor(num) => {
+                    SMSType::WrongSensor(num,reason) => {
                         let email = match Message::builder()
                             .from(from_email.parse()?)
                             .to(to_email.parse()?)
@@ -757,16 +883,36 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                         {
                             Ok(email) => email,
                             Err(e) => {
-                                eprintln!("邮件构建失败");
-                                return Err(anyhow!(e))
+                                eprintln!("{} [send_task]邮件构建失败",RED);
+                                continue;
+                                // return Err(anyhow!(e))
                             }
                         };
                         match mailer.send(&email) {
                             Ok(_) => {
-                                println!("邮件发送成功");
+                                println!("{} [send_task] 邮件发送成功",GREEN);
+                                let alarm_data = AlarmInfo {
+                                    alarm_id : None,
+                                    alarm_type : "传感器问题报警".to_string(),
+                                    alarm_time : Some(DateTime::now()), // 数据库里面显示的是0时区的时间，所以中国时间要加上8
+                                    sensor_num : num,
+                                    level : 1,
+                                    infos : InFo::new_sensor_anomaly(reason),
+
+                                };
+
+                                match alarm_info_collection.insert_one(alarm_data).await {
+                                    Ok(_result) => {
+                                        println!("{} [send_task]成功将传感器问题报警日志存入数据库",GREEN)
+                                    },
+                                    Err(err) => {
+                                        eprintln!("{} [send_task]传感器问题报警日志存入数据库是失败，原因如下: {:?}",RED,err);
+                                    }
+
+                                }
                             },
                             Err(e) => {
-                                eprintln!("邮件发送失败，请检查配置内容")
+                                eprintln!("{} [send_task]邮件发送失败，请检查配置内容",RED)
                             }
                         }
                     },
@@ -778,7 +924,7 @@ pub async fn run_sms_send_task(mut rx: mpsc::Receiver<SMSType>) -> Result<()> {
                 break;
             },
             Err(e) => {
-                eprintln!("[send_task] 任务在20s内未收到sms发送请求，继续等待");
+                eprintln!("{} [send_task] 任务在20s内未收到sms发送请求，继续等待",YELLOW);
                 continue;
             }
         }

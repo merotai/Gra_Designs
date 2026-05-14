@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
+anyhow = {workspace = true}
 actix-web = {workspace = true}
-
+actix-cors = {workspace = true}
 serde = {workspace = true}
+
+mongodb = {workspace = true}
+dotenv = {workspace = true}
+
+gd_common = {workspace = true}
+tokio-stream = {workspace = true}
 

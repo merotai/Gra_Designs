@@ -9,3 +9,10 @@ anyhow = {workspace = true}
 gd_common = {workspace = true}
 lettre = {workspace = true}
 dotenv = {workspace = true}
+mongodb = {workspace = true}
+
+chrono = {workspace = true}
+
+
+
+

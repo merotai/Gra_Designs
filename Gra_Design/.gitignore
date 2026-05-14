@@ -1,4 +1,7 @@
 target
-.env
-.idea
+
 .vscode
+.idea
+.env
+
+
